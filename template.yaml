@@ -1,0 +1,38 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Aegis - Serverless Incident Detection Platform
+
+Globals:
+  Function:
+    Runtime: python3.11
+    Timeout: 10
+    MemorySize: 128
+    Architectures:
+      - x86_64
+
+Resources:
+
+  IncidentQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: aegis-incident-queue
+      VisibilityTimeout: 30
+
+  IncidentIngestionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: aegis-ingestion
+      CodeUri: services/ingestion/
+      Handler: app.handler
+      Events:
+        IncidentQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt IncidentQueue.Arn
+      Policies:
+        - AWSLambdaBasicExecutionRole
+
+Outputs:
+  IncidentQueueUrl:
+    Description: Incident Queue URL
+    Value: !Ref IncidentQueue
