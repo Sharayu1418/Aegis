@@ -1,130 +1,103 @@
 # Aegis
 
-This project contains source code and supporting files for a serverless application that you can deploy with the SAM CLI. It includes the following files and folders.
+A serverless incident ingestion service: it reads error events off an SQS queue and collapses repeated occurrences of the same failure into a single DynamoDB incident record.
 
-- hello_world - Code for the application's Lambda function.
-- events - Invocation events that you can use to invoke the function.
-- tests - Unit tests for the application code. 
-- template.yaml - A template that defines the application's AWS resources.
+`Python 3.11` `AWS Lambda` `Amazon SQS` `DynamoDB` `AWS SAM` `boto3`
 
-The application uses several AWS resources, including Lambda functions and an API Gateway API. These resources are defined in the `template.yaml` file in this project. You can update the template to add AWS resources through the same deployment process that updates your application code.
+> Status: early. One Lambda (the ingestion path), one SAM template, no tests. The queue-to-table wiring described below is what the code does today; the rest of an incident platform — alerting, notification, status transitions — is not built yet.
 
-If you prefer to use an integrated development environment (IDE) to build and test your application, you can use the AWS Toolkit.  
-The AWS Toolkit is an open source plug-in for popular IDEs that uses the SAM CLI to build and deploy serverless applications on AWS. The AWS Toolkit also adds a simplified step-through debugging experience for Lambda function code. See the following links to get started.
+---
 
-* [CLion](https://docs.aws.amazon.com/toolkit-for-jetbrains/latest/userguide/welcome.html)
-* [GoLand](https://docs.aws.amazon.com/toolkit-for-jetbrains/latest/userguide/welcome.html)
-* [IntelliJ](https://docs.aws.amazon.com/toolkit-for-jetbrains/latest/userguide/welcome.html)
-* [WebStorm](https://docs.aws.amazon.com/toolkit-for-jetbrains/latest/userguide/welcome.html)
-* [Rider](https://docs.aws.amazon.com/toolkit-for-jetbrains/latest/userguide/welcome.html)
-* [PhpStorm](https://docs.aws.amazon.com/toolkit-for-jetbrains/latest/userguide/welcome.html)
-* [PyCharm](https://docs.aws.amazon.com/toolkit-for-jetbrains/latest/userguide/welcome.html)
-* [RubyMine](https://docs.aws.amazon.com/toolkit-for-jetbrains/latest/userguide/welcome.html)
-* [DataGrip](https://docs.aws.amazon.com/toolkit-for-jetbrains/latest/userguide/welcome.html)
-* [VS Code](https://docs.aws.amazon.com/toolkit-for-vscode/latest/userguide/welcome.html)
-* [Visual Studio](https://docs.aws.amazon.com/toolkit-for-visual-studio/latest/user-guide/welcome.html)
+## What it does
 
-## Deploy the sample application
+An SQS message arrives carrying an alarm name, a severity, and an error type and message. `services/ingestion/app.py` normalizes the error, hashes it into a fingerprint, and tries to write a new incident row keyed on that fingerprint. If a row already exists, the write is rejected and the function instead bumps `last_seen_at` on the existing incident. The result is one row per distinct failure, not one row per event, no matter how many times a broken service retries.
 
-The Serverless Application Model Command Line Interface (SAM CLI) is an extension of the AWS CLI that adds functionality for building and testing Lambda applications. It uses Docker to run your functions in an Amazon Linux environment that matches Lambda. It can also emulate your application's build environment and API.
+Every incident row carries `pk`, `sk`, `incident_id`, `status`, `alarm`, `severity`, `error_type`, `error_message`, `error_fingerprint`, `created_at`, and `last_seen_at`.
 
-To use the SAM CLI, you need the following tools.
+## Architecture
 
-* SAM CLI - [Install the SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-cli-install.html)
-* [Python 3 installed](https://www.python.org/downloads/)
-* Docker - [Install Docker community edition](https://hub.docker.com/search/?type=edition&offering=community)
+```
+   producer                SQS                     Lambda                    DynamoDB
+  ──────────           ───────────          ────────────────────        ──────────────────
+  incident      ──▶   aegis-incident  ──▶   aegis-ingestion       ──▶   pk = INCIDENT#<fp>
+  event JSON          -queue                app.handler                 sk = METADATA
+                      (visibility 30s)      │
+                                            ├─ normalize_error()   "type:message", lowered
+                                            ├─ stable_hash()       SHA-256 → fingerprint
+                                            │
+                                            ├─ put_item + condition ─▶ new incident (OPEN)
+                                            └─ on condition failure ─▶ update last_seen_at
+```
 
-To build and deploy your application for the first time, run the following in your shell:
+| Component | Where | Role |
+|---|---|---|
+| `IncidentQueue` | `template.yaml` | SQS queue `aegis-incident-queue`, 30s visibility timeout |
+| `IncidentIngestionFunction` | `template.yaml` | `aegis-ingestion`, python3.11, 128 MB, 10s timeout, SQS event source |
+| `handler` | `services/ingestion/app.py` | Parses the record, fingerprints, writes or correlates |
+| `normalize_error` / `stable_hash` | `services/ingestion/app.py` | Fingerprint derivation |
+| Incidents table | **not in the template** — see Limitations | Keyed `pk` / `sk`, name from `INCIDENTS_TABLE_NAME`, default `aegis-incidents` |
+
+## The interesting part: idempotency is the database's job, not the handler's
+
+The obvious way to deduplicate is read-then-write: query for an existing incident, and insert if you don't find one. Under SQS that is wrong. SQS is at-least-once, Lambda scales the consumer out, and two invocations processing the same failure can both read "not found" and both insert. The gap between the read and the write is the bug.
+
+Aegis has no read. It goes straight to:
+
+```python
+table.put_item(
+    Item=item,
+    ConditionExpression="attribute_not_exists(pk) AND attribute_not_exists(sk)"
+)
+```
+
+DynamoDB evaluates that condition inside the write, on a single partition, so exactly one concurrent caller can win. The loser gets `ConditionalCheckFailedException`, which the handler treats not as an error but as the signal for the second code path — this failure has been seen before, so update `last_seen_at` and move on. Duplicate suppression and first-write detection come out of the same call.
+
+The key that makes it work is the fingerprint. `normalize_error` joins `error_type` and `error_message`, lowercases, flattens newlines, and strips; `stable_hash` takes SHA-256 of that. The same failure reported by ten retries — different message IDs, different timestamps in the SQS envelope — normalizes to the same string and therefore the same `pk`. Deduplication is on what broke, not on which message said so.
+
+## Running it
+
+Requires the AWS SAM CLI, Python 3.11, Docker, and AWS credentials.
 
 ```bash
 sam build --use-container
-sam deploy --guided
+sam deploy --guided        # or: sam deploy   (samconfig.toml → stack aegis-dev, us-east-1)
 ```
 
-The first command will build the source of your application. The second command will package and deploy your application to AWS, with a series of prompts:
+The stack does not create the incidents table (see below). Create it first, keyed on `pk` (string, partition) and `sk` (string, sort), then point the function at it.
 
-* **Stack Name**: The name of the stack to deploy to CloudFormation. This should be unique to your account and region, and a good starting point would be something matching your project name.
-* **AWS Region**: The AWS region you want to deploy your app to.
-* **Confirm changes before deploy**: If set to yes, any change sets will be shown to you before execution for manual review. If set to no, the AWS SAM CLI will automatically deploy application changes.
-* **Allow SAM CLI IAM role creation**: Many AWS SAM templates, including this example, create AWS IAM roles required for the AWS Lambda function(s) included to access AWS services. By default, these are scoped down to minimum required permissions. To deploy an AWS CloudFormation stack which creates or modifies IAM roles, the `CAPABILITY_IAM` value for `capabilities` must be provided. If permission isn't provided through this prompt, to deploy this example you must explicitly pass `--capabilities CAPABILITY_IAM` to the `sam deploy` command.
-* **Save arguments to samconfig.toml**: If set to yes, your choices will be saved to a configuration file inside the project, so that in the future you can just re-run `sam deploy` without parameters to deploy changes to your application.
-
-You can find your API Gateway Endpoint URL in the output values displayed after deployment.
-
-## Use the SAM CLI to build and test locally
-
-Build your application with the `sam build --use-container` command.
+Send a test event to the deployed queue:
 
 ```bash
-Aegis$ sam build --use-container
+aws sqs send-message \
+  --queue-url "$(aws cloudformation describe-stacks --stack-name aegis-dev \
+      --query 'Stacks[0].Outputs[?OutputKey==`IncidentQueueUrl`].OutputValue' --output text)" \
+  --message-body '{"alarm":"checkout-5xx","severity":"HIGH","error_type":"TimeoutError","error_message":"upstream timed out"}'
 ```
 
-The SAM CLI installs dependencies defined in `hello_world/requirements.txt`, creates a deployment package, and saves it in the `.aws-sam/build` folder.
-
-Test a single function by invoking it directly with a test event. An event is a JSON document that represents the input that the function receives from the event source. Test events are included in the `events` folder in this project.
-
-Run functions locally and invoke them with the `sam local invoke` command.
+Send it twice. The first invocation logs `New incident created`; the second logs `Correlated incident detected; updated last_seen_at`.
 
 ```bash
-Aegis$ sam local invoke HelloWorldFunction --event events/event.json
+sam logs -n IncidentIngestionFunction --stack-name aegis-dev --tail
 ```
 
-The SAM CLI can also emulate your application's API. Use the `sam local start-api` to run the API locally on port 3000.
+## Repository map
 
-```bash
-Aegis$ sam local start-api
-Aegis$ curl http://localhost:3000/
-```
+| Path | Purpose |
+|---|---|
+| `services/ingestion/app.py` | The ingestion handler — fingerprinting, conditional write, correlation |
+| `services/ingestion/requirements.txt` | Empty; the handler needs only `boto3` from the Lambda runtime |
+| `template.yaml` | SAM template — SQS queue, Lambda, event source mapping, queue URL output |
+| `samconfig.toml` | Deploy defaults: stack `aegis-dev`, region `us-east-1` |
+| `events/event.json` | Leftover SAM scaffold event (API Gateway shape, not SQS) |
 
-The SAM CLI reads the application template to determine the API's routes and the functions that they invoke. The `Events` property on each function's definition includes the route and method for each path.
+## Limitations
 
-```yaml
-      Events:
-        HelloWorld:
-          Type: Api
-          Properties:
-            Path: /hello
-            Method: get
-```
+These are real and current, not hypothetical.
 
-## Add a resource to your application
-The application template uses AWS Serverless Application Model (AWS SAM) to define application resources. AWS SAM is an extension of AWS CloudFormation with a simpler syntax for configuring common serverless application resources such as functions, triggers, and APIs. For resources not included in [the SAM specification](https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md), you can use standard [AWS CloudFormation](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-template-resource-type-ref.html) resource types.
-
-## Fetch, tail, and filter Lambda function logs
-
-To simplify troubleshooting, SAM CLI has a command called `sam logs`. `sam logs` lets you fetch logs generated by your deployed Lambda function from the command line. In addition to printing the logs on the terminal, this command has several nifty features to help you quickly find the bug.
-
-`NOTE`: This command works for all AWS Lambda functions; not just the ones you deploy using SAM.
-
-```bash
-Aegis$ sam logs -n HelloWorldFunction --stack-name "aegis" --tail
-```
-
-You can find more information and examples about filtering Lambda function logs in the [SAM CLI Documentation](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-cli-logging.html).
-
-## Tests
-
-Tests are defined in the `tests` folder in this project. Use PIP to install the test dependencies and run tests.
-
-```bash
-Aegis$ pip install -r tests/requirements.txt --user
-# unit test
-Aegis$ python -m pytest tests/unit -v
-# integration test, requiring deploying the stack first.
-# Create the env variable AWS_SAM_STACK_NAME with the name of the stack we are testing
-Aegis$ AWS_SAM_STACK_NAME="aegis" python -m pytest tests/integration -v
-```
-
-## Cleanup
-
-To delete the sample application that you created, use the AWS CLI. Assuming you used your project name for the stack name, you can run the following:
-
-```bash
-sam delete --stack-name "aegis"
-```
-
-## Resources
-
-See the [AWS SAM developer guide](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/what-is-sam.html) for an introduction to SAM specification, the SAM CLI, and serverless application concepts.
-
-Next, you can use AWS Serverless Application Repository to deploy ready to use Apps that go beyond hello world samples and learn how authors developed their applications: [AWS Serverless Application Repository main page](https://aws.amazon.com/serverless/serverlessrepo/)
+- **The template is incomplete.** `template.yaml` provisions the queue and the function only. There is no `AWS::DynamoDB::Table`, no `INCIDENTS_TABLE_NAME` environment variable, and the function's only policy is `AWSLambdaBasicExecutionRole`. Deployed as-is, the first `put_item` fails on access. The table and its IAM grant have to be added before the stack is useful.
+- **Only the first record in a batch is processed.** The handler reads `event["Records"][0]`. SQS delivers up to 10 records per invocation; the rest are dropped and then deleted, because the function still returns 200.
+- **No failure handling on the queue.** No dead-letter queue, no redrive policy, and no partial-batch-failure response. A record that raises is retried by SQS until the visibility window and receive count run out, with nowhere to land.
+- **Fingerprints never expire.** There is no time window on correlation. An error seen in January and again in June is the same incident. `status` is written as `OPEN` at creation and never transitioned by any code in the repo.
+- **Variable text splits incidents.** `error_message` is hashed verbatim after lowering. A message containing a request ID, a timestamp, or a row count produces a distinct fingerprint every occurrence, which is exactly the case correlation is supposed to catch.
+- **`events/event.json` is stale scaffold.** It is the SAM hello-world API Gateway event, not an SQS record, so `sam local invoke` with it exercises the "no Records key" fallback rather than the real path.
+- **No tests.**
